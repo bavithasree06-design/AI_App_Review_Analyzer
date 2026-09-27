@@ -1,12 +1,16 @@
+
 import os
 import json
-import joblib
+import re
+import time
+import random
 import streamlit as st
-from openai import OpenAI
+from dotenv import load_dotenv
+from google import genai
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -17,47 +21,16 @@ st.set_page_config(
 
 
 # ============================================================
-# PROJECT PATH
+# LOAD API KEY
 # ============================================================
 
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
+load_dotenv()
 
-MODEL_PATH = os.path.join(
-    BASE_DIR,
-    "model",
-    "review_model.pkl"
-)
+api_key = os.getenv("GEMINI_API_KEY")
 
+MODEL_NAME = "gemini-3.8-flash"
 
-# ============================================================
-# LOAD LOCAL NLP MODEL
-# ============================================================
-
-@st.cache_resource
-def load_model():
-
-    if not os.path.exists(MODEL_PATH):
-        return None
-
-    try:
-        return joblib.load(MODEL_PATH)
-
-    except Exception as e:
-
-        st.error(
-            "Unable to load the NLP model."
-        )
-
-        st.code(
-            str(e)
-        )
-
-        return None
-
-
-model = load_model()
+client = genai.Client(api_key=api_key) if api_key else None
 
 
 # ============================================================
@@ -70,829 +43,484 @@ if "logged_in" not in st.session_state:
 if "username" not in st.session_state:
     st.session_state.username = ""
 
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = None
+
+if "rating" not in st.session_state:
+    st.session_state.rating = None
+
 
 # ============================================================
 # LOGIN PAGE
 # ============================================================
 
-if not st.session_state.logged_in:
+def login_page():
 
-    st.title(
-        "🤖 AI App Review Analyzer"
-    )
+    st.title("🤖 AI App Review Analyzer")
+    st.subheader("Login to Continue")
 
-    st.subheader(
-        "Login"
-    )
+    with st.form("login_form"):
 
-    username = st.text_input(
-        "Username"
-    )
+        username = st.text_input(
+            "Username",
+            placeholder="Enter your username"
+        )
 
-    password = st.text_input(
-        "Password",
-        type="password"
-    )
+        email = st.text_input(
+            "Gmail",
+            placeholder="Enter your Gmail address"
+        )
 
-    login_button = st.button(
-        "Login"
-    )
+        password = st.text_input(
+            "Password",
+            type="password",
+            placeholder="Enter your password"
+        )
 
-    if login_button:
+        submitted = st.form_submit_button(
+            "Login",
+            use_container_width=True
+        )
 
-        if username.strip() and password.strip():
+        if submitted:
 
-            st.session_state.logged_in = True
+            if not username.strip():
+                st.error("Please enter your username.")
 
-            st.session_state.username = (
-                username.strip()
+            elif not re.fullmatch(
+                r"[A-Za-z0-9._%+-]+@gmail\.com",
+                email.strip(),
+                re.IGNORECASE
+            ):
+                st.error("Please enter a valid Gmail address.")
+
+            elif not password.strip():
+                st.error("Please enter your password.")
+
+            else:
+                st.session_state.logged_in = True
+                st.session_state.username = username.strip()
+                st.rerun()
+
+
+# ============================================================
+# GEMINI API WITH RETRY
+# ============================================================
+
+def generate_with_retry(prompt):
+
+    if client is None:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. Please configure it in your .env file."
+        )
+
+    max_retries = 3
+
+    for attempt in range(max_retries):
+
+        try:
+
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt
             )
 
-            st.success(
-                "Login successful!"
+            if not response.text:
+                raise ValueError("Gemini returned an empty response.")
+
+            return response.text.strip()
+
+        except Exception as e:
+
+            error_text = str(e).lower()
+
+            retryable = any(
+                code in error_text
+                for code in [
+                    "503",
+                    "429",
+                    "500",
+                    "502",
+                    "504",
+                    "unavailable",
+                    "resource_exhausted",
+                    "internal",
+                    "deadline_exceeded"
+                ]
             )
+
+            if not retryable:
+                raise
+
+            if attempt == max_retries - 1:
+                raise RuntimeError(
+                    "Gemini is currently busy or unavailable. "
+                    "Please wait a little and try again."
+                ) from e
+
+            wait_time = 3 * (2 ** attempt) + random.uniform(0, 1)
+
+            st.warning(
+                f"Gemini is busy. Retrying in {wait_time:.1f} seconds..."
+            )
+
+            time.sleep(wait_time)
+
+
+# ============================================================
+# REVIEW ANALYSIS
+# ============================================================
+
+def analyze_review(app_name, category, review):
+
+    prompt = f"""
+You are an AI App Review Analyzer.
+
+Analyze the following app review carefully.
+
+APP NAME: {app_name}
+APP CATEGORY: {category}
+USER REVIEW: {review}
+
+INSTRUCTIONS:
+
+1. Identify the exact problem from the user's review.
+2. Give practical, real-world solutions specific to the app and issue.
+3. Every step must tell the user exactly what to do and where to do it.
+4. Avoid generic steps like restarting, reinstalling, or checking
+   permissions unless they are relevant to the specific problem.
+5. Never recommend actions that could delete user data or overwrite
+   backups without explaining the risk and checking safer alternatives.
+6. Do not repeat the user's complaint as a solution.
+7. Do not invent app settings, features, or technical details.
+8. If the exact cause is unknown, explain what the user should check first.
+9. Provide 4-6 clear, actionable steps whenever appropriate.
+10. Separate user actions from developer actions.
+11. Make sure the solution directly addresses the reported problem.
+12. If the review is positive, return "No Problem" and do not invent a solution.
+
+Return ONLY valid JSON in this exact structure:
+
+{{
+    "problem": "Actual problem or No Problem",
+    "category": "Problem category",
+    "severity": "Low, Medium, High, or None",
+    "why": "Brief explanation",
+    "steps": [
+        "Step 1",
+        "Step 2",
+        "Step 3"
+    ],
+    "user_action": "What the user should do",
+    "developer_action": "What the developer should do"
+}}
+"""
+
+    response_text = generate_with_retry(prompt)
+
+    # Remove Markdown code fences if present
+    response_text = re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        response_text.strip(),
+        flags=re.IGNORECASE
+    )
+
+    result = json.loads(response_text)
+
+    required_keys = [
+        "problem",
+        "category",
+        "severity",
+        "why",
+        "steps",
+        "user_action",
+        "developer_action"
+    ]
+
+    for key in required_keys:
+        if key not in result:
+            raise ValueError(f"Missing field in AI response: {key}")
+
+    return result
+
+
+# ============================================================
+# MAIN APPLICATION
+# ============================================================
+
+def main_app():
+
+    st.title("🤖 AI App Review Analyzer")
+
+    st.write(
+        "Analyze app reviews, identify problems, "
+        "and get practical solutions using AI."
+    )
+
+    # --------------------------------------------------------
+    # SIDEBAR
+    # --------------------------------------------------------
+
+    with st.sidebar:
+
+        st.title("👤 User Profile")
+
+        st.write(
+            f"Welcome, **{st.session_state.username}**!"
+        )
+
+        st.divider()
+
+        if st.button("🚪 Logout", use_container_width=True):
+
+            st.session_state.logged_in = False
+            st.session_state.username = ""
+            st.session_state.analysis_result = None
+            st.session_state.rating = None
 
             st.rerun()
 
+    # --------------------------------------------------------
+    # APP DETAILS
+    # --------------------------------------------------------
+
+    st.subheader("📱 App Details")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        app_name = st.text_input(
+            "App Name",
+            placeholder="Example: WhatsApp"
+        )
+
+    with col2:
+
+        app_category = st.selectbox(
+            "App Category",
+            [
+                "Communication",
+                "Shopping",
+                "Food & Delivery",
+                "Social Media",
+                "Entertainment",
+                "Education",
+                "Healthcare",
+                "Banking & Finance",
+                "Travel",
+                "Productivity",
+                "Other"
+            ]
+        )
+
+    # --------------------------------------------------------
+    # REVIEW INPUT
+    # --------------------------------------------------------
+
+    st.subheader("💬 Enter User Review")
+
+    review = st.text_area(
+        "User Review",
+        placeholder="Enter the app review here...",
+        height=150
+    )
+
+    # --------------------------------------------------------
+    # ANALYZE BUTTON
+    # --------------------------------------------------------
+
+    if st.button(
+        "🔍 Analyze Review",
+        use_container_width=True,
+        type="primary"
+    ):
+
+        if not app_name.strip():
+            st.error("Please enter the app name.")
+
+        elif not review.strip():
+            st.error("Please enter a user review.")
+
         else:
 
-            st.error(
-                "Please enter username and password."
-            )
+            try:
 
-    st.stop()
+                with st.spinner("Analyzing review with AI..."):
 
+                    result = analyze_review(
+                        app_name,
+                        app_category,
+                        review
+                    )
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+                st.session_state.analysis_result = {
+                    "app_name": app_name,
+                    "app_category": app_category,
+                    "review": review,
+                    "result": result
+                }
 
-with st.sidebar:
+                st.session_state.rating = None
 
-    st.title(
-        "🤖 AI Review Analyzer"
-    )
+            except Exception as e:
 
-    st.write(
-        f"Welcome, {st.session_state.username}"
-    )
-
-    st.divider()
-
-    if st.button(
-        "Logout"
-    ):
-
-        st.session_state.logged_in = False
-
-        st.session_state.username = ""
-
-        st.rerun()
-
-
-# ============================================================
-# MAIN TITLE
-# ============================================================
-
-st.title(
-    "🤖 AI App Review Analyzer"
-)
-
-st.write(
-    "Write a review about any application in your own words."
-)
-
-st.info(
-    "The system dynamically understands your review and "
-    "generates the problem, severity, explanation, "
-    "solution steps, user action, and developer action."
-)
-
-
-# ============================================================
-# APP DETAILS
-# ============================================================
-
-st.header(
-    "📱 App Details"
-)
-
-app_name = st.text_input(
-    "Application Name",
-    placeholder=(
-        "Example: Instagram, Amazon, Spotify, Uber..."
-    )
-)
-
-
-# ============================================================
-# APPLICATION CATEGORY
-# ============================================================
-#
-# Category is ONLY supporting information.
-#
-# It is NOT used as a problem-category restriction.
-# ============================================================
-
-app_category = st.selectbox(
-    "Application Category",
-    [
-        "Social Media",
-        "Shopping",
-        "Banking / Finance",
-        "Education",
-        "Food Delivery",
-        "Travel",
-        "Entertainment",
-        "Productivity",
-        "Healthcare",
-        "Gaming",
-        "Other"
-    ]
-)
-
-
-# ============================================================
-# REVIEW
-# ============================================================
-
-st.header(
-    "📝 Write Your Review"
-)
-
-review = st.text_area(
-    "Describe your experience in your own words",
-
-    placeholder=(
-        "Write anything about your application experience..."
-    ),
-
-    height=180
-)
-
-
-# ============================================================
-# OPENAI CLIENT
-# ============================================================
-
-def get_openai_client():
-
-    api_key = None
+                st.error(f"Analysis failed: {e}")
 
     # --------------------------------------------------------
-    # Try Streamlit secrets first
+    # DISPLAY ANALYSIS REPORT
     # --------------------------------------------------------
 
-    try:
+    report = st.session_state.analysis_result
 
-        api_key = st.secrets.get(
-            "OPENAI_API_KEY"
+    if report:
+
+        result = report["result"]
+
+        st.divider()
+
+        st.header("📊 Review Analysis Report")
+
+        # App details
+        st.subheader("📱 App Details")
+
+        st.write(f"**App Name:** {report['app_name']}")
+        st.write(f"**App Category:** {report['app_category']}")
+
+        # Review
+        st.subheader("💬 User Review")
+
+        st.info(report["review"])
+
+        # Problem statement
+        st.subheader("🚨 Problem Statement")
+
+        st.write(result["problem"])
+
+        # Category
+        st.subheader("🏷️ Problem Category")
+
+        st.write(result["category"])
+
+        # Severity
+        st.subheader("⚠️ Severity")
+
+        severity = result["severity"]
+
+        if severity.lower() == "high":
+            st.error(f"🔴 {severity}")
+
+        elif severity.lower() == "medium":
+            st.warning(f"🟠 {severity}")
+
+        elif severity.lower() == "low":
+            st.info(f"🟢 {severity}")
+
+        else:
+            st.success(f"✅ {severity}")
+
+        # Why
+        st.subheader("🔎 Why Does This Problem Occur?")
+
+        st.write(result["why"])
+
+        # Practical solution
+        st.subheader("🛠️ Step-by-Step Solution")
+
+        steps = result["steps"]
+
+        if isinstance(steps, list):
+
+            for index, step in enumerate(steps, start=1):
+                st.write(f"**Step {index}:** {step}")
+
+        else:
+            st.write(steps)
+
+        # User action
+        st.subheader("👤 User Action")
+
+        st.write(result["user_action"])
+
+        # Developer action
+        st.subheader("👨‍💻 Developer Action")
+
+        st.write(result["developer_action"])
+
+        # ----------------------------------------------------
+        # STAR RATING
+        # ----------------------------------------------------
+
+        st.divider()
+
+        st.subheader("⭐ Rate Your Experience")
+
+        rating = st.feedback(
+            "stars",
+            key="experience_star_rating"
         )
 
-    except Exception:
+        if rating is not None:
 
-        api_key = None
+            rating_value = rating + 1
 
+            st.session_state.rating = rating_value
 
-    # --------------------------------------------------------
-    # Try environment variable
-    # --------------------------------------------------------
-
-    if not api_key:
-
-        api_key = os.getenv(
-            "OPENAI_API_KEY"
-        )
-
-
-    # --------------------------------------------------------
-    # No API key
-    # --------------------------------------------------------
-
-    if not api_key:
-
-        return None
-
-
-    return OpenAI(
-        api_key=api_key
-    )
-
-
-# ============================================================
-# GENERATIVE AI ANALYSIS
-# ============================================================
-
-def generate_analysis(
-    app_name,
-    app_category,
-    review,
-    model_prediction,
-    model_confidence
-):
-
-    client = get_openai_client()
-
-    if client is None:
-
-        return {
-            "error": (
-                "OPENAI_API_KEY is not configured.\n\n"
-                "Configure your OpenAI API key in "
-                "Streamlit Secrets or your environment."
+            st.success(
+                f"Thank you for your rating! {'⭐' * rating_value}"
             )
+
+        # ----------------------------------------------------
+        # DOWNLOAD REPORT
+        # ----------------------------------------------------
+
+        st.divider()
+
+        st.subheader("📥 Download Report")
+
+        download_data = {
+            "app_name": report["app_name"],
+            "app_category": report["app_category"],
+            "user_review": report["review"],
+            "analysis": result,
+            "rating": st.session_state.rating
         }
 
-
-    # ========================================================
-    # AI SYSTEM INSTRUCTIONS
-    # ========================================================
-    #
-    # IMPORTANT:
-    #
-    # There is intentionally NO predefined:
-    #
-    # - problem category list
-    # - keyword list
-    # - solution dictionary
-    # - application-specific rule
-    #
-    # The user's review is the primary source.
-    # ========================================================
-
-    system_prompt = """
-
-You are an AI application review troubleshooting assistant.
-
-Your job is to understand ANY application review written
-naturally by a user.
-
-The application can be any application.
-
-The user can describe any experience, issue, request,
-failure, unexpected behavior, or other situation.
-
-There is NO fixed problem-category list.
-
-There is NO fixed keyword list.
-
-There is NO fixed solution dictionary.
-
-You must understand the meaning of the user's complete
-review and respond dynamically.
-
-IMPORTANT RULES:
-
-1. Read the complete user review before analyzing it.
-
-2. The user's review is the PRIMARY source of information.
-
-3. The application name is context only.
-
-4. The application category is context only.
-
-5. Do NOT assume a problem based only on the application name.
-
-6. Do NOT assume a problem based only on the application category.
-
-7. Do NOT force the review into a predefined problem category.
-
-8. Do NOT use keyword matching as the primary reasoning method.
-
-9. Do NOT use a predefined solution dictionary.
-
-10. Do NOT perform sentiment analysis.
-
-11. Determine whether the review actually describes a problem.
-
-12. If the review does NOT describe a problem, clearly say
-    that no specific problem was identified.
-
-13. If the review describes a problem, identify the actual
-    problem from the user's words and context.
-
-14. Do not invent facts that the user did not provide.
-
-15. If important information is missing, clearly mention
-    what additional information may be required.
-
-16. Severity must depend on the impact described by the user.
-
-17. Give practical troubleshooting steps relevant to the
-    actual situation.
-
-18. Do not give identical generic steps for every review.
-
-19. Different problems should receive different
-    troubleshooting approaches.
-
-20. Clearly separate USER ACTION from DEVELOPER ACTION.
-
-21. For account, payment, security, or personal-data issues,
-    recommend using the application's official support process
-    when appropriate.
-
-22. Never claim that a troubleshooting step is guaranteed.
-
-23. The local NLP model prediction is only supporting
-    information. Do not blindly follow it.
-
-24. The local NLP model does NOT determine the detailed
-    problem.
-
-25. The user's actual review has priority over the local
-    model prediction.
-
-Return ONLY valid JSON.
-
-Use exactly this structure:
-
-{
-    "problem": "actual problem identified from the review",
-    "severity": "Low",
-    "why": "reason the problem may be happening",
-    "steps": [
-        "first practical step",
-        "second practical step",
-        "third practical step",
-        "fourth practical step"
-    ],
-    "user_action": "what the user should do now",
-    "developer_action": "what the developer should investigate"
-}
-
-If there is no identifiable problem, use:
-
-"problem": "No specific problem identified from the review"
-
-and use:
-
-"severity": "Low"
-
-The severity must be exactly one of:
-
-Low
-Medium
-High
-
-Do not add any other JSON fields.
-
-Do not use markdown inside the JSON.
-"""
-
-
-    # ========================================================
-    # USER PROMPT
-    # ========================================================
-
-    user_prompt = f"""
-
-Application Name:
-{app_name}
-
-Application Category:
-{app_category}
-
-User Review:
-{review}
-
-Local NLP Model Prediction:
-{model_prediction}
-
-Local NLP Model Confidence:
-{model_confidence:.2f}%
-
-IMPORTANT:
-
-The application name and category are supporting context only.
-
-The user's actual review is the primary source.
-
-Understand the review independently.
-
-Do not blindly follow the local NLP model prediction.
-
-Determine the actual meaning of the user's review.
-
-The review may describe any type of application experience.
-
-Do not assume that the review belongs to a predefined
-problem category.
-"""
-
-
-    # ========================================================
-    # OPENAI REQUEST
-    # ========================================================
-
-    try:
-
-        response = client.responses.create(
-
-            model="gpt-5.6-luna",
-
-            instructions=system_prompt,
-
-            input=user_prompt
+        json_data = json.dumps(
+            download_data,
+            indent=4,
+            ensure_ascii=False
         )
 
-
-        output = response.output_text.strip()
-
-
-        # ====================================================
-        # REMOVE OPTIONAL MARKDOWN CODE FENCE
-        # ====================================================
-
-        if output.startswith(
-            "```json"
-        ):
-
-            output = output[7:]
-
-        elif output.startswith(
-            "```"
-        ):
-
-            output = output[3:]
-
-
-        if output.endswith(
-            "```"
-        ):
-
-            output = output[:-3]
-
-
-        output = output.strip()
-
-
-        # ====================================================
-        # PARSE JSON
-        # ====================================================
-
-        result = json.loads(
-            output
+        st.download_button(
+            label="📥 Download JSON Report",
+            data=json_data,
+            file_name="review_analysis_report.json",
+            mime="application/json",
+            use_container_width=True
         )
-
-        return result
-
-
-    except json.JSONDecodeError:
-
-        return {
-            "error": (
-                "The AI returned an invalid JSON response.\n\n"
-                "Please try the review again."
-            )
-        }
-
-
-    except Exception as e:
-
-        return {
-            "error": (
-                "AI analysis failed.\n\n"
-                f"{str(e)}"
-            )
-        }
 
 
 # ============================================================
-# ANALYZE BUTTON
+# APPLICATION ENTRY POINT
 # ============================================================
 
-if st.button(
-    "🔍 Analyze Review",
-    type="primary"
-):
+if not st.session_state.logged_in:
 
-    # ========================================================
-    # VALIDATION
-    # ========================================================
+    login_page()
 
-    if not app_name.strip():
+else:
 
-        st.warning(
-            "Please enter the application name."
-        )
+    main_app()
 
-        st.stop()
 
+# ============================================================
+# FOOTER
+# ============================================================
 
-    if not review.strip():
+st.divider()
 
-        st.warning(
-            "Please write your application review."
-        )
-
-        st.stop()
-
-
-    # ========================================================
-    # MODEL CHECK
-    # ========================================================
-
-    if model is None:
-
-        st.error(
-            "NLP model not found."
-        )
-
-        st.code(
-            MODEL_PATH
-        )
-
-        st.info(
-            "Make sure this file exists:\n"
-            "model/review_model.pkl"
-        )
-
-        st.stop()
-
-
-    # ========================================================
-    # LOCAL NLP PREDICTION
-    # ========================================================
-
-    try:
-
-        prediction = model.predict(
-            [review]
-        )[0]
-
-
-        probabilities = model.predict_proba(
-            [review]
-        )[0]
-
-
-        confidence = (
-            max(probabilities) * 100
-        )
-
-
-    except Exception as e:
-
-        st.error(
-            "Local NLP model error."
-        )
-
-        st.code(
-            str(e)
-        )
-
-        st.stop()
-
-
-    # ========================================================
-    # GENERATIVE AI ANALYSIS
-    # ========================================================
-
-    with st.spinner(
-        "🧠 Understanding your review..."
-    ):
-
-        result = generate_analysis(
-
-            app_name=app_name,
-
-            app_category=app_category,
-
-            review=review,
-
-            model_prediction=prediction,
-
-            model_confidence=confidence
-        )
-
-
-    # ========================================================
-    # ERROR HANDLING
-    # ========================================================
-
-    if "error" in result:
-
-        st.error(
-            result["error"]
-        )
-
-        st.stop()
-
-
-    # ========================================================
-    # ANALYSIS RESULT
-    # ========================================================
-
-    st.divider()
-
-    st.header(
-        "🔎 Analysis Result"
-    )
-
-
-    # ========================================================
-    # 1. PROBLEM
-    # ========================================================
-
-    st.subheader(
-        "1️⃣ Problem Identified"
-    )
-
-    problem = result.get(
-        "problem",
-        "No specific problem identified from the review."
-    )
-
-    st.write(
-        problem
-    )
-
-
-    # ========================================================
-    # 2. SEVERITY
-    # ========================================================
-
-    st.subheader(
-        "2️⃣ Severity"
-    )
-
-    severity = result.get(
-        "severity",
-        "Low"
-    )
-
-
-    if severity == "High":
-
-        st.error(
-            "🔴 High"
-        )
-
-    elif severity == "Medium":
-
-        st.warning(
-            "🟠 Medium"
-        )
-
-    elif severity == "Low":
-
-        st.success(
-            "🟢 Low"
-        )
-
-    else:
-
-        st.info(
-            severity
-        )
-
-
-    # ========================================================
-    # 3. WHY
-    # ========================================================
-
-    st.subheader(
-        "3️⃣ Why This Problem May Be Happening"
-    )
-
-    why = result.get(
-        "why",
-        "No explanation available."
-    )
-
-    st.write(
-        why
-    )
-
-
-    # ========================================================
-    # 4. SOLUTION STEPS
-    # ========================================================
-
-    st.subheader(
-        "4️⃣ Step-by-Step Solution"
-    )
-
-    steps = result.get(
-        "steps",
-        []
-    )
-
-
-    if isinstance(
-        steps,
-        list
-    ):
-
-        for index, step in enumerate(
-            steps,
-            start=1
-        ):
-
-            st.write(
-                f"**Step {index}:** {step}"
-            )
-
-    else:
-
-        st.write(
-            steps
-        )
-
-
-    # ========================================================
-    # 5. USER ACTION
-    # ========================================================
-
-    st.subheader(
-        "5️⃣ What You Should Do Now"
-    )
-
-    user_action = result.get(
-        "user_action",
-        "No user action available."
-    )
-
-    st.write(
-        user_action
-    )
-
-
-    # ========================================================
-    # 6. DEVELOPER ACTION
-    # ========================================================
-
-    st.subheader(
-        "6️⃣ What the Developer Should Check"
-    )
-
-    developer_action = result.get(
-        "developer_action",
-        "No developer action available."
-    )
-
-    st.write(
-        developer_action
-    )
-
-
-    # ========================================================
-    # LOCAL NLP INFORMATION
-    # ========================================================
-
-    with st.expander(
-        "🧠 Local NLP Model Information"
-    ):
-
-        st.write(
-            "Prediction:",
-            prediction
-        )
-
-        st.write(
-            "Confidence:",
-            f"{confidence:.2f}%"
-        )
-
-        st.caption(
-            "The local NLP model provides only a broad "
-            "normal/problem classification. The detailed "
-            "problem understanding is generated dynamically "
-            "from the user's review."
-        )
-
-
-    # ========================================================
-    # FEEDBACK
-    # ========================================================
-
-    st.divider()
-
-    st.subheader(
-        "⭐ Was this analysis useful?"
-    )
-
-    rating = st.radio(
-        "Give your feedback",
-
-        [
-            "⭐",
-            "⭐⭐",
-            "⭐⭐⭐",
-            "⭐⭐⭐⭐",
-            "⭐⭐⭐⭐⭐"
-        ],
-
-        horizontal=True
-    )
-
-
-    if st.button(
-        "Submit Feedback"
-    ):
-
-        st.success(
-            f"Thank you for your feedback: {rating}"
-        )
-
+st.caption(
+    "AI App Review Analyzer | NLP Mini Project"
+)
